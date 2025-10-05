@@ -75,8 +75,10 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, d_attn: int, dropout: float = 0.1):
         super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, d_attn)
         self.drop1 = nn.Dropout(dropout)
+        self.ln2 = nn.LayerNorm(d_model)
         self.ff1 = nn.Linear(d_model, d_model * 4)
         self.ff2 = nn.Linear(d_model * 4, d_model)
         self.drop2 = nn.Dropout(dropout)   
@@ -87,7 +89,7 @@ class TransformerBlock(nn.Module):
         x = x + self.drop1(h)  # [seq len, d_model]
 
         # position wise feedforward + residual
-        z = self.ff2(F.relu(self.ff1(x)))  # [seq len, d_model]
+        z = self.ff2(F.relu(self.ff1(self.ln2(x))))  # [seq len, d_model]
         x = x + self.drop2(z)  # [seq len, d_model]
         return x  # return attention weights for visualization
 
@@ -112,6 +114,7 @@ class TinyTransformerLM(nn.Module):
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.blocks = nn.ModuleList([TransformerBlock(d_model, d_attn, dropout) for _ in range(n_layers)])
         self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head.weight = self.token_emb.weight
 
         # Xavier initialization
         for p in self.parameters():
@@ -230,11 +233,11 @@ def train_lm(args, train_text, dev_text, vocab_index):
     :return: a NeuralLanguageModel instance trained on the given data
     """
     # Hyperparameters
-    block_size = getattr(args, 'block_size', 128)  # sequence length
-    d_model = getattr(args, 'd_model', 128)
-    d_attn = getattr(args, 'd_attn', 64)
-    n_layers = getattr(args, 'n_layers', 2)
-    dropout = getattr(args, 'dropout', 0.1)
+    block_size = getattr(args, 'block_size', 256)  # sequence length
+    d_model = getattr(args, 'd_model', 256)
+    d_attn = getattr(args, 'd_attn', 128)
+    n_layers = getattr(args, 'n_layers', 3)
+    dropout = getattr(args, 'dropout', 0.05)
     lr = getattr(args, 'lr', 3e-4)
     batch_size = getattr(args, 'batch_size', 64)
     n_epochs = getattr(args, 'n_epochs', 5)
@@ -267,7 +270,7 @@ def train_lm(args, train_text, dev_text, vocab_index):
     device = torch.device("cpu")
     model.to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
     model.train()
