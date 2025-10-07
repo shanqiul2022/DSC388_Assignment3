@@ -125,6 +125,9 @@ class TinyTransformerLM(nn.Module):
         :param x: [seq len] LongTensor of token indices
         :return: [seq len, vocab size] log probabilities over next token at each position
         """
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0) 
+
         B, T = idx.size()
         
         # Token and positional embeddings
@@ -153,7 +156,7 @@ class NeuralLanguageModel(LanguageModel):
         super().__init__()
         self.model = model
         self.vocab_index = vocab_index
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = next(model.parameters()).device
 
     def _string_to_indices(self, s):
         # Map each character to index; assume vocab is complete (27 chars)
@@ -170,7 +173,7 @@ class NeuralLanguageModel(LanguageModel):
                 # empty context, use a single space
                 context_idxs = self._string_to_indices(" ")
             
-            logits = self.model(context_idxs)  # [context len, vocab size]
+            logits = self.model(context_idxs.unsqueeze(0))  # [context len, vocab size]
             last_logits = logits[0, -1, :]  # [vocab size]    
             log_probs = F.log_softmax(last_logits, dim=-1)  # [context len, vocab size]
             return log_probs.cpu().numpy()  # return log probs for the last position
