@@ -54,16 +54,15 @@ class CausalSelfAttention(nn.Module):
         :param x: [seq len, d_model]
         :return: [seq len, d_model]
         """
-        seq_len, d_model = x.shape
+        B, T, D = x.shape
         Q = self.W_q(x)  # [seq len, d_attn]
         K = self.W_k(x)  # [seq len, d_attn]
         V = self.W_v(x)  # [seq len, d_model]
 
         # Compute attention scores
-        attn_scores = torch.matmul(Q, K.transpose(0, 1)) / self.scale  # [seq len, seq len]
+        attn_scores = torch.matmul(Q, K.transpose(1, 2)) / self.scale  # [seq len, seq len]
 
         # Causal mask to prevent attending to future positions
-        T = x.size(0)
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device = x.device), diagonal=1)  # [seq len, seq len]
         scores = attn_scores.masked_fill(mask, float('-inf'))
 
@@ -85,7 +84,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # self-attention + residual 
-        h, _ = self.attn(x)  # [seq len, d_model], [seq len, seq len]
+        h, _ = self.attn(self.ln1(x))  # [seq len, d_model], [seq len, seq len]
         x = x + self.drop1(h)  # [seq len, d_model]
 
         # position wise feedforward + residual
@@ -113,7 +112,7 @@ class TinyTransformerLM(nn.Module):
         self.max_len = max_len
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.blocks = nn.ModuleList([TransformerBlock(d_model, d_attn, dropout) for _ in range(n_layers)])
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
 
         # Xavier initialization
@@ -126,10 +125,10 @@ class TinyTransformerLM(nn.Module):
         :param x: [seq len] LongTensor of token indices
         :return: [seq len, vocab size] log probabilities over next token at each position
         """
-        T = idx.size(0)
+        B, T = idx.size()
         
         # Token and positional embeddings
-        pos = torch.arange(T, dtype=torch.long, device=idx.device)  # [seq len]
+        pos = torch.arange(T, dtype=torch.long, device=idx.device).unsqueeze(0).expand(B, T)   # [seq len]
         x = self.token_emb(idx) + self.pos_emb(pos)  # [seq len, d_model]
         # Transformer blocks
         for block in self.blocks:
@@ -172,7 +171,7 @@ class NeuralLanguageModel(LanguageModel):
                 context_idxs = self._string_to_indices(" ")
             
             logits = self.model(context_idxs)  # [context len, vocab size]
-            last_logits = logits[-1]  # [vocab size]    
+            last_logits = logits[0, -1, :]  # [vocab size]    
             log_probs = F.log_softmax(last_logits, dim=-1)  # [context len, vocab size]
             return log_probs.cpu().numpy()  # return log probs for the last position
 
@@ -267,7 +266,7 @@ def train_lm(args, train_text, dev_text, vocab_index):
         n_layers=n_layers,
         dropout=dropout,
     )
-    device = torch.device("cpu")
+    device =  torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
@@ -283,23 +282,14 @@ def train_lm(args, train_text, dev_text, vocab_index):
             y = Y_train[i:i+batch_size].to(device)  # [batch size, seq len]
             
             opt.zero_grad()
-            loss = 0.0
-            tokens_this_batch = 0
-            
-            for b in range(x.size(0)):
-                seq_in = x[b]  # [seq len]
-                seq_tgt = y[b]  # [seq len]
-                logits = model(seq_in)  # [seq len, vocab size]
-                loss_b = loss_fn(logits, seq_tgt)  # scalar
-                loss = loss + loss_b
-                tokens_this_batch += seq_tgt.numel()
-        
-        loss = loss / max(1, x.size(0)) # average over batches
-        loss.backward()
-        opt.step()
+            logits = model(x)
 
-        total_loss += loss.item() * max(1, x.size(0))
-        num_tokens += tokens_this_batch
+            B, T, V = logits.shape
+            loss = loss_fn(logits.reshape(B*T, V), y.reshape(B*T))
+            loss.backward()
+            opt.step()
+
+            total_loss += float(loss.item())
     
     model.eval()
     lm = NeuralLanguageModel(model, vocab_index)
