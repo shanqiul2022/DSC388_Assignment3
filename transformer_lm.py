@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.utils.checkpoint import checkpoint
 
 class LanguageModel(object):
 
@@ -42,12 +43,18 @@ class CausalSelfAttention(nn.Module):
     - Values in d_model
     - Uses a causal mask to prevent attention to future positions
     """
-    def __init__(self, d_model: int, d_attn: int):
+    def __init__(self, d_model: int, d_attn: int, max_len: int):
         super().__init__()
         self.W_q = nn.Linear(d_model, d_attn, bias=False)
         self.W_k = nn.Linear(d_model, d_attn, bias=False)
         self.W_v = nn.Linear(d_model, d_model, bias=False)
         self.scale = math.sqrt(d_attn)
+        # reuse causal mask to avoid re-alloc
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(max_len, max_len, dtype=torch.bool), diagonal=1),
+            persistent=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -59,23 +66,36 @@ class CausalSelfAttention(nn.Module):
         K = self.W_k(x)  # [seq len, d_attn]
         V = self.W_v(x)  # [seq len, d_model]
 
-        # Compute attention scores
-        attn_scores = torch.matmul(Q, K.transpose(1, 2)) / self.scale  # [seq len, seq len]
+        if x.device.type == "cuda":
+            # fast path on GPU
+            scores = torch.matmul(Q, K.transpose(1, 2)) / self.scale   # [B,T,T]
+            scores = scores.masked_fill(self.causal_mask[:T, :T], float('-inf'))
+            scores = scores - scores.amax(dim=-1, keepdim=True)
+            attn = F.softmax(scores, dim=-1)                           # [B,T,T]
+            out  = torch.matmul(attn, V)                               # [B,T,D]
+            return out  # no attn return
+        
+            
+        outs = []
+        KT = K.transpose(1, 2)     # [B, d_attn, T]
 
-        # Causal mask to prevent attending to future positions
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device = x.device), diagonal=1)  # [seq len, seq len]
-        scores = attn_scores.masked_fill(mask, float('-inf'))
-
-        attn_weights = F.softmax(scores, dim=-1)  # [seq len, seq len]
-        attn_output = torch.matmul(attn_weights, V)  # [seq len, d_model]
-
-        return attn_output, attn_weights  # return attention weights for visualization
+        for t in range(T):
+            s = torch.matmul(Q[:, t:t+1, :], KT) / self.scale          # [B,1,T]
+            # causal mask for this row
+            if t + 1 < T:
+                s[:, :, t+1:] = float('-inf')
+            s = s - s.amax(dim=-1, keepdim=True) 
+            a = F.softmax(s, dim=-1)                                   # [B,1,T]
+            o = torch.matmul(a, V)                                     # [B,1,D]
+            outs.append(o)
+        out = torch.cat(outs, dim=1)                                   # [B,T,D]
+        return out  # no attn return
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, d_attn: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_attn: int, max_len: int, dropout: float = 0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, d_attn)
+        self.attn = CausalSelfAttention(d_model, d_attn, max_len)
         self.drop1 = nn.Dropout(dropout)
         self.ln2 = nn.LayerNorm(d_model)
         self.ff1 = nn.Linear(d_model, d_model * 4)
@@ -84,7 +104,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # self-attention + residual 
-        h, _ = self.attn(self.ln1(x))  # [seq len, d_model], [seq len, seq len]
+        h = self.attn(self.ln1(x))  # [seq len, d_model], [seq len, seq len]
         x = x + self.drop1(h)  # [seq len, d_model]
 
         # position wise feedforward + residual
@@ -105,15 +125,20 @@ class TinyTransformerLM(nn.Module):
 
     def __init__(self, vocab_size: int, max_len: int,
                  d_model: int = 128, d_attn: int = 64, 
-                 n_layers: int = 2, dropout: float = 0.1):
+                 n_layers: int = 2, dropout: float = 0.1,
+                 use_checkpoint: bool = True
+                 ):
         super().__init__()
         self.vocab_size = vocab_size
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.max_len = max_len
         self.pos_emb = nn.Embedding(max_len, d_model)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, d_attn, dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model, d_attn, max_len, dropout) for _ in range(n_layers)]
+        )       
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
+        self.use_checkpoint = use_checkpoint
 
         # Xavier initialization
         for p in self.parameters():
@@ -131,11 +156,14 @@ class TinyTransformerLM(nn.Module):
         B, T = idx.size()
         
         # Token and positional embeddings
-        pos = torch.arange(T, dtype=torch.long, device=idx.device).unsqueeze(0).expand(B, T)   # [seq len]
-        x = self.token_emb(idx) + self.pos_emb(pos)  # [seq len, d_model]
+        pos = torch.arange(T, dtype=torch.long, device=idx.device).unsqueeze(0).expand(B, T)  
+        x = self.token_emb(idx) + self.pos_emb(pos)  # [B, T, d_model]
         # Transformer blocks
         for block in self.blocks:
-            x = block(x)  # [seq len, d_model]
+            if self.use_checkpoint and self.training:
+                x = checkpoint(lambda y: block(y), x) 
+            else:
+                x = block(x)  # [B, T, d_model]
         # Language modeling head
         logits = self.lm_head(x)  # [seq len, vocab size]
         return logits
@@ -201,66 +229,67 @@ def _build_corpus_indices(text, vocab_index):
     indices = [vocab_index.index_of(c) for c in text]
     return indices
 
-def _make_lm_batches(indices: np.ndarray, block_size: int, step:int):
+def _batch_iter(indices: np.ndarray, block_size: int, stride: int, batch_size: int, device: torch.device):
     """
-    Convert a list of indices into batches for training the LM.
-    Each batch is a tuple (input, target) where input and target are LongTensors of shape [batch size, seq len].
-    The target is the input shifted by one character.
-    :param indices: a list of indices
-    :param batch_size: the batch size
-    :param seq_len: the sequence length
-    :return: a list of (input, target) tuples
+    Stream (x,y) as [B,T] LongTensors already on `device`, without materializing all windows.
     """
-    N = len(indices)
-    xs, ys = [], []
+    ids = torch.tensor(indices, dtype=torch.long, device=device)   # whole corpus on device once
+    N = ids.numel()
     last_start = N - block_size - 1
-    for start in range(0, last_start+1, step):
-        x = indices[start:start+block_size]
-        y = indices[start+1:start+block_size+1]
-        if len(x) == block_size and len(y) == block_size:
-            xs.append(x)
-            ys.append(y)
-    if not xs:
-        return None, None
-    x_tensor = torch.tensor(np.stack(xs), dtype=torch.long)
-    y_tensor = torch.tensor(np.stack(ys), dtype=torch.long)
-    return x_tensor, y_tensor
+    if last_start < 0:
+        return
+
+    starts = torch.arange(0, last_start + 1, step=stride, dtype=torch.long, device=device)  # [S]
+    offsets = torch.arange(block_size, dtype=torch.long, device=device)                      # [T]
+    offsets_next = offsets + 1
+
+    for i in range(0, starts.numel(), batch_size):
+        s = starts[i:i + batch_size]                                       # [B]
+        idx_mat = s.unsqueeze(1) + offsets                                 # [B,T]
+        x = ids.index_select(0, idx_mat.reshape(-1)).view(-1, block_size)  # [B,T]
+        y = ids.index_select(0, (s.unsqueeze(1) + offsets_next).reshape(-1)).view(-1, block_size)
+        yield x, y
+
+def print_mem(tag: str):
+    try:
+        import psutil, os, gc
+        gc.collect()
+        rss = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+        print(f"[MEM] {tag}: {rss:.1f} MB")
+    except Exception:
+        pass
 
 def train_lm(args, train_text, dev_text, vocab_index):
-    """
-    :param args: command-line args, passed through here for your convenience
-    :param train_text: train text as a sequence of characters
-    :param dev_text: dev text as a sequence of characters
-    :param vocab_index: an Indexer of the character vocabulary (27 characters)
-    :return: a NeuralLanguageModel instance trained on the given data
-    """
     # Hyperparameters
-    block_size = getattr(args, 'block_size', 256)  # sequence length
-    d_model = getattr(args, 'd_model', 256)
-    d_attn = getattr(args, 'd_attn', 128)
-    n_layers = getattr(args, 'n_layers', 3)
-    dropout = getattr(args, 'dropout', 0.05)
-    lr = getattr(args, 'lr', 3e-4)
+    block_size = getattr(args, 'block_size', 128)
+    d_model    = getattr(args, 'd_model', 192)
+    d_attn     = getattr(args, 'd_attn', 96)
+    n_layers   = getattr(args, 'n_layers', 2)
+    dropout    = getattr(args, 'dropout', 0.05)
+    lr         = getattr(args, 'lr', 1e-4)
     batch_size = getattr(args, 'batch_size', 64)
-    n_epochs = getattr(args, 'n_epochs', 5)
-    stride = getattr(args, 'stride', 1)
+    n_epochs   = getattr(args, 'n_epochs', 15)
+    stride     = getattr(args, 'stride', 2)
 
-    # Read data
-    train_indices = _build_corpus_indices(train_text, vocab_index)  # list of indices
-    X_train, Y_train = _make_lm_batches(np.array(train_indices), block_size, stride)
-    if X_train is None:
-        seq = _build_corpus_indices(" " + train_text, vocab_index)
-        if len(seq) < block_size + 1:
-            pad = np.tile(seq, math.ceil((block_size + 1) / len(seq)))
-            seq = pad[:block_size + 1]
-        X_train = torch.tensor([seq[:block_size]], dtype=torch.long)
-        Y_train = torch.tensor([seq[1:block_size + 1]], dtype=torch.long)
-    
-    # Shuffle training data
-    perm = torch.randperm(X_train.size(0))
-    X_train = X_train[perm]
-    Y_train = Y_train[perm]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if device.type == "cpu":
+        block_size = min(block_size, 112)    
+        batch_size = min(batch_size, 16)
+        n_layers   = min(n_layers, 2)
+        d_model    = min(d_model, 192)
+        d_attn     = min(d_attn, 96)
+
+    # Build indices once
+    train_indices = np.array(_build_corpus_indices(train_text, vocab_index), dtype=np.int64)
+    # Edge case: very short corpus → pad
+    if train_indices.size < block_size + 1:
+        seed = np.array(_build_corpus_indices(" " + train_text, vocab_index), dtype=np.int64)
+        while seed.size < block_size + 1:
+            seed = np.tile(seed, 2)
+        train_indices = seed[:block_size + 1]
+
+    # Model
     model = TinyTransformerLM(
         vocab_size=len(vocab_index),
         max_len=block_size,
@@ -268,32 +297,49 @@ def train_lm(args, train_text, dev_text, vocab_index):
         d_attn=d_attn,
         n_layers=n_layers,
         dropout=dropout,
-    )
-    device =  torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+        use_checkpoint=True
+    ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, eps = 1e-8, weight_decay=0.01, betas=(0.9, 0.95))
     loss_fn = nn.CrossEntropyLoss()
 
     model.train()
+    # print_mem("before epoch")
     for epoch in range(n_epochs):
-        total_loss = 0.0
-        num_tokens = 0
+        token_loss_sum = 0.0
+        token_count    = 0
 
-        for i in range(0, X_train.size(0), batch_size):
-            x = X_train[i:i+batch_size].to(device)  # [batch size, seq len]
-            y = Y_train[i:i+batch_size].to(device)  # [batch size, seq len]
-            
-            opt.zero_grad()
-            logits = model(x)
-
+        for x, y in _batch_iter(train_indices, block_size, stride, batch_size, device):
+            opt.zero_grad(set_to_none=True)
+            # Forward
+            logits = model(x)                         # [B,T,V]
             B, T, V = logits.shape
-            loss = loss_fn(logits.reshape(B*T, V), y.reshape(B*T))
+            loss = loss_fn(logits.view(B*T, V), y.view(B*T))
+
+            # Guard against NaN/Inf
+            if not torch.isfinite(loss):
+                print("Non-finite loss; skipping batch and reducing LR.")
+                for pg in opt.param_groups:
+                    pg['lr'] = max(pg['lr'] * 0.5, 1e-6)
+                continue
+
+             # Backward + clip + step
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             opt.step()
 
-            total_loss += float(loss.item())
-    
+             # Metrics
+            token_loss_sum += float(loss.item()) * (B * T)
+            token_count    += (B * T)
+            # print_mem("after step")
+
+        avg_ce = token_loss_sum / max(1, token_count)
+        if not math.isfinite(avg_ce):
+            ppl = float('inf')
+        else:
+            ppl = math.exp(min(avg_ce, 80.0))
+        print(f"Epoch {epoch+1}/{n_epochs} — CE {avg_ce:.4f} — PPL {ppl:.2f}")
+
     model.eval()
-    lm = NeuralLanguageModel(model, vocab_index)
+    lm = NeuralLanguageModel(model, vocab_index)  # shares device with model
     return lm
