@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torch.utils.checkpoint import checkpoint
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
 
 class LanguageModel(object):
 
@@ -135,7 +137,8 @@ class TinyTransformerLM(nn.Module):
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, d_attn, max_len, dropout) for _ in range(n_layers)]
-        )       
+        )  
+        self.final_ln = nn.LayerNorm(d_model)     
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.token_emb.weight
         self.use_checkpoint = use_checkpoint
@@ -161,9 +164,10 @@ class TinyTransformerLM(nn.Module):
         # Transformer blocks
         for block in self.blocks:
             if self.use_checkpoint and self.training:
-                x = checkpoint(lambda y: block(y), x) 
+                x = checkpoint(block, x, use_reentrant=False) 
             else:
                 x = block(x)  # [B, T, d_model]
+        x = self.final_ln(x)  # [B, T, d_model]
         # Language modeling head
         logits = self.lm_head(x)  # [seq len, vocab size]
         return logits
@@ -233,22 +237,28 @@ def _batch_iter(indices: np.ndarray, block_size: int, stride: int, batch_size: i
     """
     Stream (x,y) as [B,T] LongTensors already on `device`, without materializing all windows.
     """
-    ids = torch.tensor(indices, dtype=torch.long, device=device)   # whole corpus on device once
-    N = ids.numel()
+    ids_np = np.asarray(indices, dtype=np.int64) 
+    N = ids_np.shape[0]
     last_start = N - block_size - 1
     if last_start < 0:
         return
+    x_buf, y_buf = [], []
+    for start in range(0, last_start + 1, stride):
+        x_buf.append(ids_np[start: start + block_size])
+        y_buf.append(ids_np[start + 1: start + block_size + 1])
 
-    starts = torch.arange(0, last_start + 1, step=stride, dtype=torch.long, device=device)  # [S]
-    offsets = torch.arange(block_size, dtype=torch.long, device=device)                      # [T]
-    offsets_next = offsets + 1
+        if len(x_buf) == batch_size:
+            x_cpu = torch.from_numpy(np.stack(x_buf))  # [B,T] on CPU
+            y_cpu = torch.from_numpy(np.stack(y_buf))  # [B,T] on CPU
+            x_buf.clear(); y_buf.clear()
 
-    for i in range(0, starts.numel(), batch_size):
-        s = starts[i:i + batch_size]                                       # [B]
-        idx_mat = s.unsqueeze(1) + offsets                                 # [B,T]
-        x = ids.index_select(0, idx_mat.reshape(-1)).view(-1, block_size)  # [B,T]
-        y = ids.index_select(0, (s.unsqueeze(1) + offsets_next).reshape(-1)).view(-1, block_size)
-        yield x, y
+            yield x_cpu.to(device, non_blocking=False), y_cpu.to(device, non_blocking=False)
+
+    # Flush tail
+    if x_buf:
+        x_cpu = torch.from_numpy(np.stack(x_buf))
+        y_cpu = torch.from_numpy(np.stack(y_buf))
+        yield x_cpu.to(device, non_blocking=False), y_cpu.to(device, non_blocking=False)
 
 def print_mem(tag: str):
     try:
@@ -265,8 +275,8 @@ def train_lm(args, train_text, dev_text, vocab_index):
     d_model    = getattr(args, 'd_model', 192)
     d_attn     = getattr(args, 'd_attn', 96)
     n_layers   = getattr(args, 'n_layers', 2)
-    dropout    = getattr(args, 'dropout', 0.05)
-    lr         = getattr(args, 'lr', 1e-4)
+    dropout    = getattr(args, 'dropout', 0.1)
+    lr         = getattr(args, 'lr', 5e-5)
     batch_size = getattr(args, 'batch_size', 64)
     n_epochs   = getattr(args, 'n_epochs', 15)
     stride     = getattr(args, 'stride', 2)
@@ -300,11 +310,28 @@ def train_lm(args, train_text, dev_text, vocab_index):
         use_checkpoint=True
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, eps = 1e-8, weight_decay=0.01, betas=(0.9, 0.95))
-    loss_fn = nn.CrossEntropyLoss()
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if p.ndim == 1:              # LayerNorm weights, biases
+            no_decay.append(p)
+        elif 'pos_emb' in n or 'token_emb' in n:   # embeddings
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    opt = torch.optim.AdamW(
+        [{'params': decay,    'weight_decay': 0.01},
+        {'params': no_decay, 'weight_decay': 0.0}],
+        lr=lr, betas=(0.9, 0.95), eps=1e-8
+        )
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     model.train()
     # print_mem("before epoch")
+    warmup = LinearLR(opt, start_factor=0.3, total_iters=1)
+    cosine = CosineAnnealingLR(opt, T_max=max(1, n_epochs-1), eta_min=lr*0.1)
+    scheduler = SequentialLR(opt, [warmup, cosine], milestones=[1])
+
     for epoch in range(n_epochs):
         token_loss_sum = 0.0
         token_count    = 0
@@ -332,13 +359,14 @@ def train_lm(args, train_text, dev_text, vocab_index):
             token_loss_sum += float(loss.item()) * (B * T)
             token_count    += (B * T)
             # print_mem("after step")
-
+            del logits, x, y, loss
         avg_ce = token_loss_sum / max(1, token_count)
         if not math.isfinite(avg_ce):
             ppl = float('inf')
         else:
             ppl = math.exp(min(avg_ce, 80.0))
         print(f"Epoch {epoch+1}/{n_epochs} — CE {avg_ce:.4f} — PPL {ppl:.2f}")
+        scheduler.step()
 
     model.eval()
     lm = NeuralLanguageModel(model, vocab_index)  # shares device with model
